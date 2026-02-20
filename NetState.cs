@@ -79,11 +79,7 @@ namespace Server.Network
 
         public sbyte TimeOffset { get; set; }
 
-#if LOCALE
 		private SocketAsyncEventArgs m_ReceiveEventArgs, m_SendEventArgs;
-#else
-        private AsyncCallback m_OnReceive, m_OnSend;
-#endif
 
         private MessagePump m_MessagePump;
         private ServerInfo[] m_ServerInfo;
@@ -611,24 +607,9 @@ namespace Server.Network
                         if (gram != null && !_sending)
                         {
                             _sending = true;
-#if LOCALE
+
 						    m_SendEventArgs.SetBuffer( gram.Buffer, 0, gram.Length );
 						    Send_Start();
-#else
-                            try
-                            {
-                                m_Socket.BeginSend(gram.Buffer, 0, gram.Length, SocketFlags.None, m_OnSend, m_Socket);
-                            }
-                            catch (Exception ex)
-                            {
-                                if (Core.Debug)
-                                {
-                                    TraceException(ex);
-                                }
-
-                                Dispose(false);
-                            }
-#endif
                         }
                     }
                 }
@@ -668,7 +649,6 @@ namespace Server.Network
             }
         }
 
-#if LOCALE
 		public void Start() 
         {
 			m_ReceiveEventArgs = new SocketAsyncEventArgs();
@@ -687,80 +667,106 @@ namespace Server.Network
 			Receive_Start();
 		}
 
-        private void Receive_Start()
+        internal void Receive_Start()
         {
-            if (!m_Running || m_Disposing || m_Paused) return;
+            // Usiamo un loop per gestire le operazioni che finiscono in modo sincrono
+            // senza fare ricorsione e senza usare Task.Run
+            bool isPending = true;
 
-            lock (m_AsyncLock)
+            while (isPending)
             {
-                if ((m_AsyncState & (AsyncState.Pending | AsyncState.Paused)) != 0)
+                if (!m_Running || m_Disposing || m_Paused)
                     return;
 
-                m_AsyncState |= AsyncState.Pending;
-            }
-
-            try
-            {
-                // Se torna false, l'operazione è finita subito (sincrona)
-                if (!m_Socket.ReceiveAsync(m_ReceiveEventArgs))
+                lock (m_AsyncLock)
                 {
-                    // Eseguiamo il processo, ma NON chiamiamo Receive_Start ricorsivamente qui
-                    // Usiamo una coda o un segnale per evitare lo StackOverflow
-                    Task.Run(() => Receive_Process(m_ReceiveEventArgs));
+                    // Se c'è già un'operazione pendente o siamo in pausa, usciamo
+                    if ((m_AsyncState & (AsyncState.Pending | AsyncState.Paused)) != 0)
+                        return;
+
+                    m_AsyncState |= AsyncState.Pending;
+                }
+
+                try
+                {
+                    // Se ReceiveAsync torna false, l'operazione è completata SINCROMAMENTE
+                    if (!m_Socket.ReceiveAsync(m_ReceiveEventArgs))
+                    {
+                        // Processiamo i dati subito
+                        int byteCount = m_ReceiveEventArgs.BytesTransferred;
+
+                        if (m_ReceiveEventArgs.SocketError != SocketError.Success || byteCount <= 0)
+                        {
+                            Dispose(false);
+                            return;
+                        }
+
+                        // Puliamo lo stato pending PRIMA di processare per permettere il prossimo ciclo
+                        lock (m_AsyncLock)
+                        {
+                            m_AsyncState &= ~AsyncState.Pending;
+                        }
+
+                        // Inserimento dati e notifica al MessagePump
+                        ProcessReceivedData(byteCount);
+
+                        if (Volatile.Read(ref PacketsInQueue) >= 100)
+                            return;
+
+                        // Il loop 'while' ricomincerà e chiamerà di nuovo ReceiveAsync
+                        // Questo evita lo StackOverflow perché siamo in un ciclo, non in ricorsione
+                        continue;
+                    }
+                    else
+                    {
+                        // L'operazione è asincrona (verrà gestita da Receive_Completion)
+                        isPending = false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (Core.Debug) TraceException(ex);
+                    Dispose(false);
+                    return;
                 }
             }
-            catch (Exception ex)
-            {
-                if (Core.Debug)
-                    TraceException(ex);
-                Dispose(false);
-            }
         }
 
-        private void Receive_Completion(object sender, SocketAsyncEventArgs e)
+        private void ProcessReceivedData(int byteCount)
         {
-            // Prima puliamo lo stato PENDING, poi processiamo
-            lock (m_AsyncLock)
-            {
-                m_AsyncState &= ~AsyncState.Pending;
-            }
-
-            Receive_Process(e);
-        }
-
-        private void Receive_Process(SocketAsyncEventArgs e)
-        {
-            int byteCount = e.BytesTransferred;
-
-            // Gestione errori e disconnessione
-            if (e.SocketError != SocketError.Success || byteCount <= 0)
-            {
-                Dispose(false);
-                return;
-            }
-            else if (m_Disposing)
-            {
-                return;
-            }
-
             m_NextCheckActivity = DateTime.UtcNow + TimeSpan.FromMinutes(1.2);
 
-            // Copia i dati nel buffer circolare (Thread-Safe)
             lock (m_Buffer)
             {
                 m_Buffer.Enqueue(m_RecvBuffer.AsSpan(0, byteCount));
             }
 
-            // Notifica al sistema di processing (HandleReceive)
             m_MessagePump.OnReceive(this);
+            m_MessagePump.OnReceive_Notify();
+        }
 
-            if (PacketsInQueue < 100) // Esempio di limite
+        private void Receive_Completion(object sender, SocketAsyncEventArgs e)
+        {
+            lock (m_AsyncLock)
+            {
+                m_AsyncState &= ~AsyncState.Pending;
+            }
+
+            int byteCount = e.BytesTransferred;
+
+            if (e.SocketError != SocketError.Success || byteCount <= 0)
+            {
+                Dispose(false);
+                return;
+            }
+
+            ProcessReceivedData(byteCount);
+
+            // Dopo il completamento asincrono, riavviamo il loop di ricezione
+            // Se il client è Throttled, non chiamiamo Receive_Start qui
+            if (Volatile.Read(ref PacketsInQueue) < 100)
             {
                 Receive_Start();
-            }
-            else
-            {
-                m_Paused = true; // Flag da gestire per il Resume
             }
         }
 
@@ -884,267 +890,6 @@ namespace Server.Network
                 }
             } while (isCompletedSynchronously && m_Running);
         }
-#else
-
-        public void Start()
-        {
-            m_OnReceive = OnReceive;
-            m_OnSend = OnSend;
-
-            m_Running = true;
-
-            if (m_Socket == null || m_Paused)
-            {
-                return;
-            }
-
-            try
-            {
-                lock (m_AsyncLock)
-                {
-                    if ((m_AsyncState & (AsyncState.Pending | AsyncState.Paused)) == 0)
-                    {
-                        InternalBeginReceive();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                if (Core.Debug)
-                {
-                    TraceException(ex);
-                }
-
-                Dispose(false);
-            }
-        }
-
-        private void InternalBeginReceive()
-        {
-            m_AsyncState |= AsyncState.Pending;
-
-            m_Socket.BeginReceive(m_RecvBuffer, 0, m_RecvBuffer.Length, SocketFlags.None, m_OnReceive, m_Socket);
-        }
-
-        private void OnReceive(IAsyncResult asyncResult)
-        {
-            Socket s = (Socket)asyncResult.AsyncState;
-
-            try
-            {
-                int byteCount = s.EndReceive(asyncResult);
-
-                if (byteCount > 0)
-                {
-                    m_NextCheckActivity = DateTime.UtcNow + TimeSpan.FromMinutes(1.2);
-
-                    //byte[] buffer = m_RecvBuffer;
-                    ReadOnlySpan<byte> buffer = m_RecvBuffer.AsSpan().Slice(0, byteCount);
-
-                    lock (m_Buffer)
-                    {
-                        m_Buffer.Enqueue(buffer);//, 0, byteCount);
-                    }
-
-                    m_MessagePump.OnReceive(this);
-
-                    lock (m_AsyncLock)
-                    {
-                        m_AsyncState &= ~AsyncState.Pending;
-
-                        if ((m_AsyncState & AsyncState.Paused) == 0)
-                        {
-                            try
-                            {
-                                InternalBeginReceive();
-                            }
-                            catch (Exception ex)
-                            {
-                                if (Core.Debug)
-                                {
-                                    TraceException(ex);
-                                }
-
-                                Dispose(false);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    Dispose(false);
-                }
-            }
-            catch
-            {
-                Dispose(false);
-            }
-        }
-
-        private void OnSend(IAsyncResult asyncResult)
-        {
-            Socket s = (Socket)asyncResult.AsyncState;
-
-            try
-            {
-                int bytes = s.EndSend(asyncResult);
-
-                if (bytes <= 0)
-                {
-                    Dispose(false);
-                    return;
-                }
-
-                m_NextCheckActivity = DateTime.UtcNow + TimeSpan.FromMinutes(1.2);
-
-                if (CoalesceSleep >= 0)
-                {
-                    Thread.Sleep(CoalesceSleep);
-                }
-
-                SendQueue.Gram gram;
-
-                lock (m_SendQueue)
-                {
-                    gram = m_SendQueue.Dequeue();
-
-                    if (gram == null && m_SendQueue.IsFlushReady)
-                    {
-                        gram = m_SendQueue.CheckFlushReady();
-                    }
-                }
-
-                if (gram != null)
-                {
-                    try
-                    {
-                        s.BeginSend(gram.Buffer, 0, gram.Length, SocketFlags.None, m_OnSend, s);
-                    }
-                    catch (Exception ex)
-                    {
-                        if (Core.Debug)
-                        {
-                            TraceException(ex);
-                        }
-
-                        Dispose(false);
-                    }
-                }
-                else
-                {
-                    lock (_sendL)
-                    {
-                        _sending = false;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                Dispose(false);
-            }
-        }
-
-        public static void Pause()
-        {
-            m_Paused = true;
-
-            for (int i = 0; i < m_Instances.Count; ++i)
-            {
-                NetState ns = m_Instances[i];
-
-                lock (ns.m_AsyncLock)
-                {
-                    ns.m_AsyncState |= AsyncState.Paused;
-                }
-            }
-        }
-
-        public static void Resume()
-        {
-            m_Paused = false;
-
-            for (int i = 0; i < m_Instances.Count; ++i)
-            {
-                NetState ns = m_Instances[i];
-
-                if (ns.m_Socket == null)
-                {
-                    continue;
-                }
-
-                lock (ns.m_AsyncLock)
-                {
-                    ns.m_AsyncState &= ~AsyncState.Paused;
-
-                    try
-                    {
-                        if ((ns.m_AsyncState & AsyncState.Pending) == 0)
-                        {
-                            ns.InternalBeginReceive();
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        if (Core.Debug)
-                        {
-                            TraceException(ex);
-                        }
-
-                        ns.Dispose(false);
-                    }
-                }
-            }
-        }
-
-        public bool Flush()
-        {
-            if (m_Socket == null)
-            {
-                return false;
-            }
-
-            lock (_sendL)
-            {
-                if (_sending)
-                {
-                    return false;
-                }
-
-                SendQueue.Gram gram;
-
-                lock (m_SendQueue)
-                {
-                    if (!m_SendQueue.IsFlushReady)
-                    {
-                        return false;
-                    }
-
-                    gram = m_SendQueue.CheckFlushReady();
-                }
-
-                if (gram != null)
-                {
-                    try
-                    {
-                        _sending = true;
-                        m_Socket.BeginSend(gram.Buffer, 0, gram.Length, SocketFlags.None, m_OnSend, m_Socket);
-                        return true;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (Core.Debug)
-                        {
-                            TraceException(ex);
-                        }
-
-                        Dispose(false);
-                    }
-                }
-            }
-
-            return false;
-        }
-#endif
 
         public PacketHandler GetHandler(byte packetID)
         {
@@ -1292,13 +1037,8 @@ namespace Server.Network
             m_Buffer = null;
             m_RecvBuffer = null;
 
-#if LOCALE
 			m_ReceiveEventArgs = null;
 			m_SendEventArgs = null;
-#else
-            m_OnReceive = null;
-            m_OnSend = null;
-#endif
 
             m_Running = false;
 

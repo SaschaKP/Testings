@@ -23,11 +23,14 @@ namespace Server.Network
         private ConcurrentQueue<PendingPacket> m_ToProcess = new ConcurrentQueue<PendingPacket>();
         private ConcurrentQueue<NetState> m_Queue;
         private Queue<NetState> m_WorkingQueue;
-        private Thread m_Original;
 
-        public MessagePump(Thread original)
+        public MessagePump()
         {
-            m_Original = original;
+        }
+
+        public void Begin()
+        {
+            
             System.Net.IPEndPoint[] ipep = Listener.EndPoints;
 
             m_Listeners = new Listener[ipep.Length];
@@ -55,6 +58,7 @@ namespace Server.Network
                 }
             }
             while (!success);
+            Thread_Slice();
         }
 
         public Listener[] Listeners { get => m_Listeners; set => m_Listeners = value; }
@@ -152,7 +156,6 @@ namespace Server.Network
 
                         // Qui sei al sicuro: il World è bloccato su questo thread
                         pkt.Handler.OnReceive(pkt.State, ref r);
-                        Interlocked.Decrement(ref pkt.State.PacketsInQueue);
                     }
                 }
                 catch (Exception ex)
@@ -162,10 +165,9 @@ namespace Server.Network
                 finally
                 {
                     ArrayPool<byte>.Shared.Return(pkt.Buffer);
-                    int remaining = Interlocked.Decrement(ref pkt.State.PacketsInQueue);
-                    if (remaining <= 5) // Soglia di "fame" di dati
+                    if (Interlocked.Decrement(ref pkt.State.PacketsInQueue) == 50)
                     {
-                        pkt.State.CheckThrottling();
+                        pkt.State.Receive_Start();
                     }
                 }
             }
@@ -176,7 +178,7 @@ namespace Server.Network
         {
             while (!Core.Closing)
             {
-                _Signal.WaitOne(); // Svegliato da OnReceive o Listener
+                _Signal.WaitOne(10); // Svegliato da OnReceive o Listener
 
                 // 1. Accetta nuove connessioni
                 CheckListener();
@@ -192,6 +194,11 @@ namespace Server.Network
                     }
                 }
             }
+        }
+
+        public void OnReceive_Notify()
+        {
+            _Signal.Set();
         }
 
         private const int BufferSize = 4096;

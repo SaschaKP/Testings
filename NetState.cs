@@ -533,10 +533,6 @@ namespace Server.Network
             m_ConnectedOn = DateTime.UtcNow;
         }
 
-        private bool _sending;
-        private object _sendL = new object();
-        private object _compressorLock = new object();
-
         public void Send(Packet p)
         {
             if (p == null)
@@ -549,15 +545,10 @@ namespace Server.Network
                 return;
             }
 
-            byte[] buffer = null;
-            int length = 0;
-            lock (_compressorLock)
+            lock (m_SendQueue)
             {
-                buffer = p.Compile(m_CompressionEnabled, out length);
-            }
-            if (buffer != null)
-            {
-                if (buffer.Length <= 0 || length <= 0)
+                byte[] buffer = p.Compile(m_CompressionEnabled, out int length);
+                if (buffer == null || length <= 0)
                 {
                     p.OnSend();
                     return;
@@ -565,51 +556,22 @@ namespace Server.Network
 
                 try
                 {
-                    SendQueue.Gram gram;
+                    // 2. ENQUEUE: Inseriamo il pacchetto compilato nella coda di invio
+                    SendQueue.Gram gram = m_SendQueue.Enqueue(buffer, length);
 
-                    lock (_sendL)
+                    // 3. START: Se non stiamo già inviando, facciamo partire il socket
+                    // Usiamo il flag _sending (già presente nel tuo codice)
+                    if (gram != null)
                     {
-                        lock (m_SendQueue)
-                        {
-                            gram = m_SendQueue.Enqueue(buffer, length);
-                        }
-
-                        if (gram != null && !_sending)
-                        {
-                            _sending = true;
-
-						    m_SendEventArgs.SetBuffer( gram.Buffer, 0, gram.Length );
-						    Send_Start();
-                        }
+                        // Impostiamo il buffer del SAEA con i dati appena messi in coda
+                        m_SendEventArgs.SetBuffer(gram.Buffer, 0, gram.Length);
+                        Send_Start();
                     }
                 }
                 catch (CapacityExceededException)
                 {
                     Console.WriteLine("Client: {0}: Too much data pending, disconnecting...", this);
                     Dispose(false);
-                }
-
-                p.OnSend();
-            }
-            else
-            {
-                bool opl = p is OPLInfo;
-                using (StreamWriter op = new StreamWriter("null_send.log", true))
-                {
-                    op.Write("{0} Client: {1}: null buffer send...", Core.MistedDateTime, this);
-                    if (opl)
-                    {
-                        op.WriteLine("ignoring");
-                        op.WriteLine(new StackTrace());
-                        Console.WriteLine("Client: {0}: null buffer send...ignoring", this);
-                    }
-                    else
-                    {
-                        op.WriteLine("disconnecting");
-                        op.WriteLine(new StackTrace());
-                        Console.WriteLine("Client: {0}: null buffer send...disconnecting", this);
-                        Dispose();
-                    }
                 }
             }
         }
@@ -731,21 +693,23 @@ namespace Server.Network
 
         private void Send_Start()
 		{
-			try {
-				bool result = false;
-
-				do {
-					result = !m_Socket.SendAsync( m_SendEventArgs );
-
-					if ( result )
-						Send_Process( m_SendEventArgs );
-				} while ( result ); 
-			} catch ( Exception ex ) {
-				if(Core.Debug)
-					TraceException( ex );
-				Dispose( false );
-			}
-		}
+            try
+            {
+                // Se SendAsync torna false, l'operazione è finita subito (Sincrona)
+                if (!m_Socket.SendAsync(m_SendEventArgs))
+                {
+                    // Gestiamo il completamento sincrono senza ricorsione
+                    Send_Process(m_SendEventArgs);
+                    // IMPORTANTE: Se è sincrona, dobbiamo continuare a svuotare la coda
+                    Send_InternalExecute();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Core.Debug) TraceException(ex);
+                Dispose(false);
+            }
+        }
 
         private void Send_Completion(object sender, SocketAsyncEventArgs e)
         {
@@ -800,14 +764,9 @@ namespace Server.Network
 			}
 		}
 
-        private int m_IsSending = 0; // 0 = Idle, 1 = Busy
         public bool Flush()
         {
             if (m_Socket == null || !m_Running) return false;
-
-            // Tenta di impostare m_IsSending a 1 solo se è 0. Operazione atomica.
-            if (Interlocked.CompareExchange(ref m_IsSending, 1, 0) != 0)
-                return false; // Era già in corso un invio
 
             try
             {
@@ -816,7 +775,6 @@ namespace Server.Network
             }
             catch
             {
-                Interlocked.Exchange(ref m_IsSending, 0);
                 return false;
             }
         }
@@ -827,26 +785,41 @@ namespace Server.Network
             do
             {
                 isCompletedSynchronously = false;
-                SendQueue.Gram gram;
+                SendQueue.Gram gram = null;
+
                 lock (m_SendQueue)
                 {
                     gram = m_SendQueue.Dequeue();
+
                     if (gram == null && m_SendQueue.IsFlushReady)
                         gram = m_SendQueue.CheckFlushReady();
+
+                    if (gram == null)
+                    {
+                        // CODA VUOTA: resettiamo lo stato di invio e usciamo
+                        return;
+                    }
                 }
-                if (gram != null)
+
+                // Fuori dal lock, impostiamo il buffer per il SAEA
+                m_SendEventArgs.SetBuffer(gram.Buffer, 0, gram.Length);
+
+                try
                 {
-                    m_SendEventArgs.SetBuffer(gram.Buffer, 0, gram.Length);
+                    // Se SendAsync torna FALSE, l'invio è finito SUBITO (sincrono)
                     if (!m_Socket.SendAsync(m_SendEventArgs))
                     {
                         Send_Process(m_SendEventArgs);
-                        isCompletedSynchronously = true; // Continua il loop senza richiamare se stesso
+                        isCompletedSynchronously = true; // Continua il loop per il prossimo pacchetto
                     }
                 }
-                else
+                catch (Exception ex)
                 {
-                    Interlocked.Exchange(ref m_IsSending, 0);
+                    if (Core.Debug) TraceException(ex);
+                    Dispose(false);
+                    return;
                 }
+
             } while (isCompletedSynchronously && m_Running);
         }
 

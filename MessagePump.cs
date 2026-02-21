@@ -5,6 +5,8 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Threading;
+using Server.Items;
+using System.Threading.Tasks;
 #endregion
 
 namespace Server.Network
@@ -103,11 +105,11 @@ namespace Server.Network
             // Dobbiamo estrarre i pacchetti completi qui per liberare il ByteQueue
 
             ByteQueue buffer = ns.Buffer;
+
             lock (buffer)
             {
-                while (ns.Running && buffer.Length > 0)
+                while (buffer.Length > 0)
                 {
-                    // ... logica Seed e identificazione PacketID/Handler ...
                     if (!ns.Seeded)
                     {
                         if (!TryHandleSeed(ns, buffer)) break;
@@ -116,30 +118,40 @@ namespace Server.Network
                     byte packetID = buffer.GetPacketID();
                     PacketHandler handler = ns.GetHandler(packetID);
 
-                    if (handler == null) 
+                    if (handler == null)
                     {
-                        break; 
+                        break;
                     }
 
                     int packetLength = handler.Length > 0 ? handler.Length : buffer.GetPacketLength();
-                    if (buffer.Length < packetLength) break;
+                    if (buffer.Length < packetLength) 
+                    {
+                        TraceUnknownPacket(ns, buffer);
+                        break; 
+                    }
 
-                    // AFFITTIAMO QUI
                     byte[] rented = ArrayPool<byte>.Shared.Rent(packetLength);
                     buffer.Dequeue(rented.AsSpan(0, packetLength));
 
-                    Interlocked.Increment(ref ns.PacketsInQueue);
-                    // PASSAGGIO DI PROPRIETÀ: lo mettiamo in coda
-                    m_ToProcess.Enqueue(new PendingPacket
-                    {
-                        State = ns,
-                        Buffer = rented,
-                        Length = packetLength,
-                        Handler = handler
-                    });
+                    m_ToProcess.Enqueue
+                    (
+                        new PendingPacket
+                        {
+                            State = ns,
+                            Buffer = rented,
+                            Length = packetLength,
+                            Handler = handler
+                        }
+                    );
                 }
-                Core.Set();
             }
+
+            if(ns.IsDisposing)
+            {
+                ns.InternalFinalize();
+            }
+
+            Core.Set();
         }
 
         public void Slice()
@@ -147,15 +159,26 @@ namespace Server.Network
             // Questo gira sul MAIN THREAD (Thread Original)
             while (m_ToProcess.TryDequeue(out PendingPacket pkt))
             {
+                bool isValid = false;
+                NetState ns = null;
                 try
                 {
-                    if (pkt.State != null && pkt.State.Running && pkt.Handler != null)
+                    ns = pkt.State;
+                    isValid = ns != null && ns.Running && !ns.IsDisposing;
+
+                    if (isValid && pkt.Handler != null)
                     {
                         ReadOnlySpan<byte> data = pkt.Buffer.AsSpan(0, pkt.Length);
                         PacketReader r = new PacketReader(ref data, pkt.Length, pkt.Handler.Length != 0);
 
                         // Qui sei al sicuro: il World è bloccato su questo thread
                         pkt.Handler.OnReceive(pkt.State, ref r);
+                        Console.WriteLine($"pkt.State: {pkt.State} - pkt.Handler.PacketId: {pkt.Handler.PacketID} - pkt.State.IsDisposing: {pkt.State.IsDisposing}");
+                    }
+                    //TODO: rimuovere dopo il debug!
+                    else
+                    {
+                        Console.WriteLine($"pkt.State: {pkt.State?.ToString() ?? "null"} - pkt.State.IsDisposing: {pkt.State?.IsDisposing.ToString() ?? "false"} - pkt.Handler: {pkt.Handler?.PacketID.ToString() ?? "unknown"} - pkt.State.IsDisposing: {pkt.State?.IsDisposing.ToString() ?? "true"}");
                     }
                 }
                 catch (Exception ex)
@@ -165,9 +188,15 @@ namespace Server.Network
                 finally
                 {
                     ArrayPool<byte>.Shared.Return(pkt.Buffer);
-                    if (Interlocked.Decrement(ref pkt.State.PacketsInQueue) == 50)
+                    //int remaining = Interlocked.Decrement(ref pkt.State.PacketsInQueue);
+
+                    if(isValid)
                     {
-                        pkt.State.Receive_Start();
+                        ns.Receive_Start();
+                    }
+                    else
+                    {
+                        ns?.Dispose();
                     }
                 }
             }
@@ -186,13 +215,15 @@ namespace Server.Network
                 // 2. Processa i NetState che hanno ricevuto dati
                 while (m_Queue.TryDequeue(out NetState ns))
                 {
-                    if (ns != null && ns.Running)
+                    if (ns != null)
                     {
-                        // Estrae i pacchetti dal ByteQueue e li mette in m_ToProcess
-                        // Questo svuota il buffer di ricezione il prima possibile
-                        OnReceive(ns);
+                        if(!ns.IsDisposing)
+                            OnReceive(ns);
+                        else
+                            ns.InternalFinalize();
                     }
                 }
+                NetState.ProcessDisposedQueue();
             }
         }
 
@@ -268,58 +299,6 @@ namespace Server.Network
                 new PacketReader(ref ros, actualRead, false).Trace(ns);
             }
             finally { ArrayPool<byte>.Shared.Return(packetBuffer); }
-        }
-
-        public void HandleReceive(NetState ns)
-        {
-            ByteQueue buffer = ns.Buffer;
-            if (buffer == null) return;
-
-            while (ns.Running)
-            {
-                PacketHandler handler = null;
-                int packetLength = 0;
-                byte[] rented = null;
-
-                lock (buffer) // Lock minimo solo per ispezionare l'header
-                {
-                    if (buffer.Length <= 0) break;
-
-                    if (!ns.Seeded)
-                    {
-                        if (!TryHandleSeed(ns, buffer)) break;
-                        if (buffer.Length <= 0) break;
-                    }
-
-                    byte packetID = buffer.GetPacketID();
-                    handler = ns.GetHandler(packetID);
-
-                    if (handler == null) { /* Dispose... */ break; }
-
-                    packetLength = handler.Length > 0 ? handler.Length : buffer.GetPacketLength();
-
-                    if (packetLength <= 0 || buffer.Length < packetLength)
-                        break; // Dati insufficienti, attendiamo la prossima receive
-
-                    // Estrazione atomica
-                    rented = ArrayPool<byte>.Shared.Rent(packetLength);
-                    buffer.Dequeue(rented.AsSpan(0, packetLength));
-                }
-
-                // LOGICA FUORI DAL LOCK
-                try
-                {
-                    ReadOnlySpan<byte> data = rented.AsSpan(0, packetLength);
-                    // La tua PacketReader riceve lo span e imposta Position = 1 o 3
-                    PacketReader r = new PacketReader(ref data, packetLength, handler.Length != 0);
-
-                    handler.OnReceive(ns, ref r);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(rented);
-                }
-            }
         }
     }
 }

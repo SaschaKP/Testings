@@ -49,33 +49,6 @@ namespace Server.Network
         private byte[] m_RecvBuffer;
         private SendQueue m_SendQueue;
         private bool m_Running;
-        internal int PacketsInQueue = 0;
-        internal int Throttled = 0; // 0 = False, 1 = True (Usa int per Interlocked)
-        public void CheckThrottling()
-        {
-            // Se siamo in pausa e la coda è scesa sotto una soglia di sicurezza (es. 10)
-            if (Interlocked.CompareExchange(ref Throttled, 0, 1) == 1)
-            {
-                // Se la coda è davvero bassa, ripartiamo
-                if (Volatile.Read(ref PacketsInQueue) < 10)
-                {
-                    Receive_Start();
-                }
-                else
-                {
-                    // Se ancora troppa roba, rimettiamo a 1
-                    Interlocked.Exchange(ref Throttled, 1);
-                }
-            }
-        }
-
-        public void CheckStatus()
-        {
-            if (m_Running && Throttled == 1 && PacketsInQueue < 5)
-            {
-                CheckThrottling(); // Forza il risveglio se per qualche motivo è rimasto appeso
-            }
-        }
 
         public sbyte TimeOffset { get; set; }
 
@@ -122,7 +95,11 @@ namespace Server.Network
 
         public bool SentFirstPacket { get; set; }
 
-        public bool BlockAllPackets { get => m_BlockAllPackets; set => m_BlockAllPackets = value; }
+        public bool BlockAllPackets 
+        { 
+            get => m_BlockAllPackets;
+            set => m_BlockAllPackets = value;
+        }
 
         public ClientFlags Flags { get; set; }
 
@@ -558,6 +535,7 @@ namespace Server.Network
 
         private bool _sending;
         private object _sendL = new object();
+        private object _compressorLock = new object();
 
         public void Send(Packet p)
         {
@@ -571,26 +549,18 @@ namespace Server.Network
                 return;
             }
 
-            byte[] buffer = p.Compile(m_CompressionEnabled, out int length);
-
+            byte[] buffer = null;
+            int length = 0;
+            lock (_compressorLock)
+            {
+                buffer = p.Compile(m_CompressionEnabled, out length);
+            }
             if (buffer != null)
             {
                 if (buffer.Length <= 0 || length <= 0)
                 {
                     p.OnSend();
                     return;
-                }
-
-                PacketSendProfile prof = null;
-
-                if (Core.Profiling)
-                {
-                    prof = PacketSendProfile.Acquire(p.GetType());
-                }
-
-                if (prof != null)
-                {
-                    prof.Start();
                 }
 
                 try
@@ -620,11 +590,6 @@ namespace Server.Network
                 }
 
                 p.OnSend();
-
-                if (prof != null)
-                {
-                    prof.Finish(length);
-                }
             }
             else
             {
@@ -710,9 +675,6 @@ namespace Server.Network
                         // Inserimento dati e notifica al MessagePump
                         ProcessReceivedData(byteCount);
 
-                        if (Volatile.Read(ref PacketsInQueue) >= 100)
-                            return;
-
                         // Il loop 'while' ricomincerà e chiamerà di nuovo ReceiveAsync
                         // Questo evita lo StackOverflow perché siamo in un ciclo, non in ricorsione
                         continue;
@@ -764,10 +726,7 @@ namespace Server.Network
 
             // Dopo il completamento asincrono, riavviamo il loop di ricezione
             // Se il client è Throttled, non chiamiamo Receive_Start qui
-            if (Volatile.Read(ref PacketsInQueue) < 100)
-            {
-                Receive_Start();
-            }
+            Receive_Start();
         }
 
         private void Send_Start()
@@ -992,6 +951,7 @@ namespace Server.Network
             {
                 flush = Flush();
             }
+
             if (m_Gumps != null)
             {
                 for (int i = m_Gumps.Count - 1; i >= 0; --i)
@@ -1000,9 +960,14 @@ namespace Server.Network
                 }
             }
 
+            m_Disposed.Enqueue(this);
+        }
+
+        public void InternalFinalize()
+        {
             try
             {
-                m_Socket.Shutdown(SocketShutdown.Both);
+                m_Socket?.Shutdown(SocketShutdown.Both);
             }
             catch (SocketException ex)
             {
@@ -1014,7 +979,7 @@ namespace Server.Network
 
             try
             {
-                m_Socket.Close();
+                m_Socket?.Close();
             }
             catch (SocketException ex)
             {
@@ -1040,26 +1005,13 @@ namespace Server.Network
 			m_ReceiveEventArgs = null;
 			m_SendEventArgs = null;
 
-            m_Running = false;
-
-            lock (m_Disposed)
-            {
-                m_Disposed.Enqueue(this);
-            }
-
             lock (m_SendQueue)
             {
-                if ( /*!flush &&*/ !m_SendQueue.IsEmpty)
+                if (!m_SendQueue.IsEmpty)
                 {
                     m_SendQueue.Clear();
                 }
             }
-
-            //UNDONE: abolizione ConnectedUUIDs
-            /*if (m_Account != null && m_Account.AccessLevel < AccessLevel.GameMaster)
-            {
-                ConnectedUUIDs.Remove(m_Account.CurrentUUID);
-            }*/
         }
 
         public static void Initialize()
@@ -1092,19 +1044,18 @@ namespace Server.Network
             }
         }
 
-        private static Queue<NetState> m_Disposed = new Queue<NetState>();
+        private static ConcurrentQueue<NetState> m_Disposed = new();
 
         public static void ProcessDisposedQueue()
         {
-            lock (m_Disposed)
+            int breakout = 0;
+
+            while (breakout < 200 && m_Disposed.Count > 0)
             {
-                int breakout = 0;
-
-                while (breakout < 200 && m_Disposed.Count > 0)
+                ++breakout;
+                if (m_Disposed.TryDequeue(out NetState ns))
                 {
-                    ++breakout;
-                    NetState ns = m_Disposed.Dequeue();
-
+                    ns.InternalFinalize();
                     Mobile m = ns.m_Mobile;
                     Account a = ns.m_Account;
 

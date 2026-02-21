@@ -143,6 +143,10 @@ namespace Server.Network
                             Handler = handler
                         }
                     );
+                    if (packetID == 0x5D || packetID == 0x00 || packetID == 0xF8)
+                    {
+                        break; // Fermati solo per questo ciclo, ma non distruggere i dati successivi
+                    }
                 }
             }
 
